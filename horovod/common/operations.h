@@ -68,7 +68,7 @@ Status CheckInitialized();
 extern "C" {
 
 // C interface to initialize Horovod.
-void horovod_init(const int *ranks, int nranks);
+void horovod_init(const int *ranks, int nranks, bool keep_global);
 
 // C interface to initialize Horovod with the given MPI communicator.
 void horovod_init_comm(MPI_Comm comm);
@@ -102,12 +102,14 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> output,
                               std::shared_ptr<ReadyEvent> ready_event,
                               const std::string name, const int device,
+                              const bool global_op,
                               StatusCallback callback);
 
 Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<ReadyEvent> ready_event,
                               const std::string name, const int device,
+                              const bool global_op,
                               StatusCallback callback);
 
 Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
@@ -115,6 +117,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> output, int root_rank,
                               std::shared_ptr<ReadyEvent> ready_event,
                               const std::string name, const int device,
+                              const bool global_op,
                               StatusCallback callback);
 
 } // namespace common

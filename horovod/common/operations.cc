@@ -90,6 +90,8 @@ struct TensorTableEntry {
   std::shared_ptr<ReadyEvent> ready_event;
   // GPU to do reduction on, or CPU_DEVICE_ID in case of CPU.
   int device = CPU_DEVICE_ID;
+  // Flag to perform op globally
+  bool global;
   // A callback to call with the status.
   StatusCallback callback;
 };
@@ -194,6 +196,11 @@ struct HorovodGlobalState {
 
   // Do hierarchical allreduce with MPI + NCCL.
   bool hierarchical_allreduce = false;
+
+  // If Horovod is initialized with subset of ranks, maintain a copy of global
+  // communicator too
+  bool keep_global = false;
+  MPI_Comm group_comm;
 
 // The CUDA stream used for data transfers and within-allreduce operations.
 // A naive implementation would use the TensorFlow StreamExecutor CUDA
@@ -342,6 +349,26 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
                            << MPIRequest::RequestType_Name(message_type)
                            << ", but another rank did an "
                            << MPIRequest::RequestType_Name(request_type) << ".";
+      break;
+    }
+  }
+
+  // Check that requested operations are either all local or all global,
+  // and that Horovod was initialized consistent with the current global flag 
+  bool ref_global = requests[0].global();
+  if (!error && ref_global && !horovod_global.keep_global) {
+      error = true;
+      error_message_stream << "Attempted global operation, although Horovod was not initialized "
+                           << "with keep_global=true.";
+  }
+  for (unsigned int i = 1; i < requests.size(); i++) {
+    if (error) {
+      break;
+    }
+    if (requests[i].global() != ref_global ) {
+      error = true;
+      error_message_stream << "Mismatched global flags. One rank attempted local "
+                           << "operation, while the other attempted a global one.";
       break;
     }
   }
@@ -498,6 +525,7 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
     response.set_response_type(MPIResponse::BROADCAST);
   }
   response.set_devices(devices);
+  response.set_global(ref_global);
 
   // Clear all queued up requests for this name. They are now taken care of
   // by the constructed MPI response.
@@ -698,6 +726,7 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
 // Process an MPIResponse by doing a reduction, a gather, a broadcast, or
 // raising an error.
 void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
+
   std::vector<TensorTableEntry> entries;
   {
     // Lock on the tensor table.
@@ -777,7 +806,11 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       timeline.ActivityEnd(e.tensor_name);
     }
   }
-
+  bool global_allreduce = horovod_global.ranks.size()==0 || response.global();
+  bool do_hierarchical = horovod_global.hierarchical_allreduce && global_allreduce; 
+  MPI_Comm mpi_comm = (!horovod_global.keep_global || global_allreduce) ?
+                 horovod_global.mpi_comm :
+                 horovod_global.group_comm;
   Status status;
   if (response.response_type() == MPIResponse::ALLGATHER) {
     assert(entries.size() == 1);
@@ -832,7 +865,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     auto result = MPI_Allgatherv(
         e.tensor->data(), (int)e.tensor->shape().num_elements(),
         GetMPIDataType(e.tensor), (void*)e.output->data(), recvcounts,
-        displcmnts, GetMPIDataType(e.tensor), horovod_global.mpi_comm);
+        displcmnts, GetMPIDataType(e.tensor), mpi_comm);
     delete[] recvcounts;
     delete[] displcmnts;
     MPI_CHECK(entries, "MPI_Allgatherv", result)
@@ -869,12 +902,17 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
       // Determine GPU IDs of the devices participating in this communicator.
       std::vector<int32_t> nccl_device_map;
-      if (horovod_global.hierarchical_allreduce) {
+      if (do_hierarchical) {
+      //if (horovod_global.hierarchical_allreduce) {
         for (int rank : horovod_global.local_comm_ranks) {
           nccl_device_map.push_back(response.devices()[rank]);
         }
-      } else {
-        nccl_device_map = response.devices();
+      } else {    // consider all possibilities here. keep_global = true/false, ranks.size() /= 0, reponse.global() = t/f
+        if(global_allreduce) { 
+          nccl_device_map = response.devices();
+        } else {
+          nccl_device_map = horovod_global.ranks;
+        }
       }
 
 #if HOROVOD_GPU_ALLREDUCE == 'N'
@@ -885,14 +923,16 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
         int nccl_rank, nccl_size;
         MPI_Comm nccl_id_bcast_comm;
-        if (horovod_global.hierarchical_allreduce) {
+        if (do_hierarchical) {
+        //if (horovod_global.hierarchical_allreduce) {
           nccl_rank = horovod_global.local_rank;
           nccl_size = horovod_global.local_size;
           nccl_id_bcast_comm = horovod_global.local_comm;
         } else {
-          nccl_rank = horovod_global.rank;
-          nccl_size = horovod_global.size;
-          nccl_id_bcast_comm = horovod_global.mpi_comm;
+          int nccl_rank, nccl_size;
+          MPI_Comm_rank(mpi_comm, &nccl_rank);
+          MPI_Comm_size(mpi_comm, &nccl_size);
+          nccl_id_bcast_comm = mpi_comm;
         }
 
         ncclUniqueId nccl_id;
@@ -912,10 +952,11 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
         // Barrier helps NCCL to synchronize after initialization and avoid
         // deadlock that we've been seeing without it.
-        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(horovod_global.mpi_comm));
+        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(mpi_comm));
 
         ACTIVITY_END_ALL(entries, timeline)
       }
+
 #elif HOROVOD_GPU_ALLREDUCE == 'D'
       if (!horovod_global.ddl_initialized) {
         // Initialize DDL
@@ -1008,7 +1049,8 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                 ddl_allreduce(buffer_data, (size_t)num_elements, ddl_data_type,
                               DDL_OP_SUM))
 #else
-      if (horovod_global.hierarchical_allreduce) {
+      if (do_hierarchical) {
+      //if (horovod_global.hierarchical_allreduce) {
         int element_size;
         MPI_Type_size(GetMPIDataType(first_entry.tensor), &element_size); 
 
@@ -1257,7 +1299,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                 MPI_Allreduce(MPI_IN_PLACE, (void*)buffer_data,
                               (int)num_elements,
                               GetMPIDataType(first_entry.tensor), MPI_SUM,
-                              horovod_global.mpi_comm))
+                              mpi_comm))
       ACTIVITY_END_ALL(entries, timeline)
 
       // Copy memory out of the fusion buffer.
@@ -1299,7 +1341,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                 MPI_Allreduce(sendbuf, (void*)e.output->data(),
                               (int)e.tensor->shape().num_elements(),
                               GetMPIDataType(e.tensor), MPI_SUM,
-                              horovod_global.mpi_comm))
+                              mpi_comm))
       ACTIVITY_END_ALL(entries, timeline)
     }
 
@@ -1323,7 +1365,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     MPI_CHECK(entries, "MPI_Bcast",
               MPI_Bcast(data_ptr, (int)e.tensor->shape().num_elements(),
                         GetMPIDataType(e.tensor), e.root_rank,
-                        horovod_global.mpi_comm))
+                        mpi_comm))
     ACTIVITY_END_ALL(entries, timeline)
 
     timeline.End(e.tensor_name, e.output);
@@ -1449,7 +1491,13 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     MPI_Group work_group;
     MPI_Group_incl(world_group, state.ranks.size(), &(state.ranks[0]),
                    &work_group);
-    MPI_Comm_create_group(MPI_COMM_WORLD, work_group, 0, &(state.mpi_comm));
+    if (state.keep_global) {
+      MPI_Comm_dup(MPI_COMM_WORLD, &(horovod_global.mpi_comm));
+      MPI_Comm_create_group(MPI_COMM_WORLD, work_group, 0, &(state.group_comm));
+    } else {
+      MPI_Comm_create_group(MPI_COMM_WORLD, work_group, 0, &(state.mpi_comm));
+      horovod_global.group_comm = nullptr;
+    }
     if (state.mpi_comm == MPI_COMM_NULL) {
       std::cerr << "WARNING: Unable to create Horovod communicator, using "
                    "MPI_COMM_WORLD instead."
@@ -1547,6 +1595,14 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
       (size != local_size)) {
     state.hierarchical_allreduce = true;
   }
+
+  // Issue warning if hierarchical allreduce is enabled with keep_global=true 
+  if (is_coordinator && state.hierarchical_allreduce && state.keep_global && state.ranks.size()>1) {
+    std::cerr
+        << "WARNING: Hierarchical allreduce will only be used for global allreduce."
+        << std::endl;
+  }
+
 
   // Issue warning if hierarchical allreduce is enabled in heterogeneous cluster
   if (is_coordinator && state.hierarchical_allreduce && !state.is_homogeneous) {
@@ -1864,12 +1920,13 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.
-void InitializeHorovodOnce(const int* ranks, int nranks) {
+void InitializeHorovodOnce(const int* ranks, int nranks, bool keep_global) {
   // Ensure background thread is only started once.
   if (!horovod_global.initialize_flag.test_and_set()) {
     for (int i = 0; i < nranks; i++) {
       horovod_global.ranks.push_back(ranks[i]);
     }
+    horovod_global.keep_global = keep_global;
 
     horovod_global.background_thread =
         std::thread(BackgroundThreadLoop, std::ref(horovod_global));
@@ -1892,13 +1949,13 @@ Status CheckInitialized() {
 
 extern "C" {
 
-void horovod_init(const int* ranks, int nranks) {
-  InitializeHorovodOnce(ranks, nranks);
+void horovod_init(const int* ranks, int nranks, bool keep_global) {
+  InitializeHorovodOnce(ranks, nranks, keep_global);
 }
 
 void horovod_init_comm(MPI_Comm comm) {
   MPI_Comm_dup(comm, &(horovod_global.mpi_comm));
-  InitializeHorovodOnce(NULL, 0);
+  InitializeHorovodOnce(NULL, 0, false);
 }
 
 void horovod_shutdown() {
@@ -1981,12 +2038,14 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> output,
                               std::shared_ptr<ReadyEvent> ready_event,
                               const std::string name, const int device,
+                              const bool global_op,
                               StatusCallback callback) {
   MPIRequest message;
   message.set_request_rank(horovod_global.rank);
   message.set_tensor_name(name);
   message.set_tensor_type(tensor->dtype());
   message.set_device(device);
+  message.set_global(global_op);
   message.set_request_type(MPIRequest::ALLREDUCE);
   for (int i = 0; i < tensor->shape().dims(); i++) {
     message.add_tensor_shape((int64_t)tensor->shape().dim_size(i));
@@ -1999,6 +2058,7 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
   e.output = output;
   e.ready_event = ready_event;
   e.device = device;
+  e.global = global_op;
   e.callback = callback;
 
   std::lock_guard<std::mutex> guard(horovod_global.mutex);
@@ -2017,12 +2077,14 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<ReadyEvent> ready_event,
                               const std::string name, const int device,
+                              const bool global_op,
                               StatusCallback callback) {
   MPIRequest message;
   message.set_request_rank(horovod_global.rank);
   message.set_tensor_name(name);
   message.set_tensor_type(tensor->dtype());
   message.set_device(device);
+  message.set_global(global_op);
   message.set_request_type(MPIRequest::ALLGATHER);
   for (int i = 0; i < tensor->shape().dims(); i++) {
     message.add_tensor_shape((int64_t)tensor->shape().dim_size(i));
@@ -2034,6 +2096,7 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
   e.tensor = tensor;
   e.ready_event = ready_event;
   e.device = device;
+  e.global = global_op;
   e.callback = callback;
 
   std::lock_guard<std::mutex> guard(horovod_global.mutex);
@@ -2053,6 +2116,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> output, int root_rank,
                               std::shared_ptr<ReadyEvent> ready_event,
                               const std::string name, const int device,
+                              const bool global_op,
                               StatusCallback callback) {
   MPIRequest message;
   message.set_request_rank(horovod_global.rank);
@@ -2060,6 +2124,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
   message.set_tensor_type(tensor->dtype());
   message.set_root_rank(root_rank);
   message.set_device(device);
+  message.set_global(global_op);
   message.set_request_type(MPIRequest::BROADCAST);
   for (int i = 0; i < tensor->shape().dims(); i++) {
     message.add_tensor_shape((int64_t)tensor->shape().dim_size(i));
@@ -2073,6 +2138,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
   e.root_rank = root_rank;
   e.ready_event = ready_event;
   e.device = device;
+  e.global = global_op;
   e.callback = callback;
 
   std::lock_guard<std::mutex> guard(horovod_global.mutex);

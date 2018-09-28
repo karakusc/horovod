@@ -55,7 +55,7 @@ class HorovodBasics(object):
         full_path = get_extension_full_path(pkg_path, *args)
         self.MPI_LIB_CTYPES = ctypes.CDLL(full_path, mode=ctypes.RTLD_GLOBAL)
 
-    def init(self, comm=None):
+    def init(self, comm=None, keep_global=False):
         """A function that initializes Horovod.
 
         Args:
@@ -81,7 +81,7 @@ class HorovodBasics(object):
         else:
             comm_size = len(comm)
             return self.MPI_LIB_CTYPES.horovod_init(
-                (ctypes.c_int * comm_size)(*comm), ctypes.c_int(comm_size))
+                (ctypes.c_int * comm_size)(*comm), ctypes.c_int(comm_size), ctypes.c_bool(keep_global))
 
     def shutdown(self):
         """A function that shuts Horovod down."""

@@ -124,7 +124,8 @@ struct MPIRequest FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
     VT_TENSOR_NAME = 10,
     VT_ROOT_RANK = 12,
     VT_DEVICE = 14,
-    VT_TENSOR_SHAPE = 16
+    VT_TENSOR_SHAPE = 16,
+    VT_GLOBAL = 18
   };
   int32_t request_rank() const {
     return GetField<int32_t>(VT_REQUEST_RANK, 0);
@@ -144,6 +145,9 @@ struct MPIRequest FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   int32_t device() const {
     return GetField<int32_t>(VT_DEVICE, 0);
   }
+  bool global() const {
+    return GetField<bool>(VT_GLOBAL, 0); 
+  }
   const flatbuffers::Vector<int64_t> *tensor_shape() const {
     return GetPointer<const flatbuffers::Vector<int64_t> *>(VT_TENSOR_SHAPE);
   }
@@ -156,6 +160,7 @@ struct MPIRequest FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
            verifier.Verify(tensor_name()) &&
            VerifyField<int32_t>(verifier, VT_ROOT_RANK) &&
            VerifyField<int32_t>(verifier, VT_DEVICE) &&
+           VerifyField<bool>(verifier, VT_GLOBAL) &&
            VerifyField<flatbuffers::uoffset_t>(verifier, VT_TENSOR_SHAPE) &&
            verifier.Verify(tensor_shape()) &&
            verifier.EndTable();
@@ -180,6 +185,9 @@ struct MPIRequestBuilder {
   void add_root_rank(int32_t root_rank) {
     fbb_.AddElement<int32_t>(MPIRequest::VT_ROOT_RANK, root_rank, 0);
   }
+  void add_global(bool global) {
+    fbb_.AddElement<bool>(MPIRequest::VT_GLOBAL, global, 0);
+  }
   void add_device(int32_t device) {
     fbb_.AddElement<int32_t>(MPIRequest::VT_DEVICE, device, 0);
   }
@@ -192,7 +200,7 @@ struct MPIRequestBuilder {
   }
   MPIRequestBuilder &operator=(const MPIRequestBuilder &);
   flatbuffers::Offset<MPIRequest> Finish() {
-    const auto end = fbb_.EndTable(start_, 7);
+    const auto end = fbb_.EndTable(start_, 8);
     auto o = flatbuffers::Offset<MPIRequest>(end);
     return o;
   }
@@ -206,10 +214,12 @@ inline flatbuffers::Offset<MPIRequest> CreateMPIRequest(
     flatbuffers::Offset<flatbuffers::String> tensor_name = 0,
     int32_t root_rank = 0,
     int32_t device = 0,
+    bool global = false,
     flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_shape = 0) {
   MPIRequestBuilder builder_(_fbb);
   builder_.add_tensor_shape(tensor_shape);
   builder_.add_device(device);
+  builder_.add_global(global);
   builder_.add_root_rank(root_rank);
   builder_.add_tensor_name(tensor_name);
   builder_.add_request_rank(request_rank);
@@ -226,6 +236,7 @@ inline flatbuffers::Offset<MPIRequest> CreateMPIRequestDirect(
     const char *tensor_name = nullptr,
     int32_t root_rank = 0,
     int32_t device = 0,
+    bool global = false,
     const std::vector<int64_t> *tensor_shape = nullptr) {
   return horovod::common::wire::CreateMPIRequest(
       _fbb,
@@ -235,6 +246,7 @@ inline flatbuffers::Offset<MPIRequest> CreateMPIRequestDirect(
       tensor_name ? _fbb.CreateString(tensor_name) : 0,
       root_rank,
       device,
+      global,
       tensor_shape ? _fbb.CreateVector<int64_t>(*tensor_shape) : 0);
 }
 
@@ -306,7 +318,8 @@ struct MPIResponse FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
     VT_TENSOR_NAMES = 6,
     VT_ERROR_MESSAGE = 8,
     VT_DEVICES = 10,
-    VT_TENSOR_SIZES = 12
+    VT_TENSOR_SIZES = 12,
+    VT_GLOBAL = 14
   };
   MPIResponseType response_type() const {
     return static_cast<MPIResponseType>(GetField<int8_t>(VT_RESPONSE_TYPE, 0));
@@ -316,6 +329,9 @@ struct MPIResponse FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   }
   const flatbuffers::String *error_message() const {
     return GetPointer<const flatbuffers::String *>(VT_ERROR_MESSAGE);
+  }
+  const flatbuffers::Vector<bool> *global() const {
+    return GetPointer<const flatbuffers::Vector<bool> *>(VT_GLOBAL);
   }
   const flatbuffers::Vector<int32_t> *devices() const {
     return GetPointer<const flatbuffers::Vector<int32_t> *>(VT_DEVICES);
@@ -333,6 +349,7 @@ struct MPIResponse FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
            verifier.Verify(error_message()) &&
            VerifyField<flatbuffers::uoffset_t>(verifier, VT_DEVICES) &&
            verifier.Verify(devices()) &&
+           verifier.Verify(global()) &&
            VerifyField<flatbuffers::uoffset_t>(verifier, VT_TENSOR_SIZES) &&
            verifier.Verify(tensor_sizes()) &&
            verifier.EndTable();
@@ -342,6 +359,9 @@ struct MPIResponse FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
 struct MPIResponseBuilder {
   flatbuffers::FlatBufferBuilder &fbb_;
   flatbuffers::uoffset_t start_;
+  void add_global(bool global) {
+    fbb_.AddElement<bool>(MPIResponse::VT_GLOBAL, global, 0);
+  }
   void add_response_type(MPIResponseType response_type) {
     fbb_.AddElement<int8_t>(MPIResponse::VT_RESPONSE_TYPE, static_cast<int8_t>(response_type), 0);
   }
@@ -363,7 +383,7 @@ struct MPIResponseBuilder {
   }
   MPIResponseBuilder &operator=(const MPIResponseBuilder &);
   flatbuffers::Offset<MPIResponse> Finish() {
-    const auto end = fbb_.EndTable(start_, 5);
+    const auto end = fbb_.EndTable(start_, 6);
     auto o = flatbuffers::Offset<MPIResponse>(end);
     return o;
   }
@@ -375,10 +395,12 @@ inline flatbuffers::Offset<MPIResponse> CreateMPIResponse(
     flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<flatbuffers::String>>> tensor_names = 0,
     flatbuffers::Offset<flatbuffers::String> error_message = 0,
     flatbuffers::Offset<flatbuffers::Vector<int32_t>> devices = 0,
+    bool global = false,
     flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_sizes = 0) {
   MPIResponseBuilder builder_(_fbb);
   builder_.add_tensor_sizes(tensor_sizes);
   builder_.add_devices(devices);
+  builder_.add_global(global);
   builder_.add_error_message(error_message);
   builder_.add_tensor_names(tensor_names);
   builder_.add_response_type(response_type);
@@ -391,6 +413,7 @@ inline flatbuffers::Offset<MPIResponse> CreateMPIResponseDirect(
     const std::vector<flatbuffers::Offset<flatbuffers::String>> *tensor_names = nullptr,
     const char *error_message = nullptr,
     const std::vector<int32_t> *devices = nullptr,
+    const bool *global = nullptr,
     const std::vector<int64_t> *tensor_sizes = nullptr) {
   return horovod::common::wire::CreateMPIResponse(
       _fbb,
@@ -398,6 +421,7 @@ inline flatbuffers::Offset<MPIResponse> CreateMPIResponseDirect(
       tensor_names ? _fbb.CreateVector<flatbuffers::Offset<flatbuffers::String>>(*tensor_names) : 0,
       error_message ? _fbb.CreateString(error_message) : 0,
       devices ? _fbb.CreateVector<int32_t>(*devices) : 0,
+      global,
       tensor_sizes ? _fbb.CreateVector<int64_t>(*tensor_sizes) : 0);
 }
 

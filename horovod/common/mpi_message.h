@@ -67,6 +67,9 @@ public:
   int32_t device() const;
   void set_device(int32_t value);
 
+  bool global() const;
+  void set_global(bool value);
+
   const std::vector<int64_t>& tensor_shape() const;
   void set_tensor_shape(const std::vector<int64_t>& value);
   void add_tensor_shape(int64_t value);
@@ -80,6 +83,7 @@ private:
   MPIDataType tensor_type_ = MPIDataType::HOROVOD_UINT8;
   int32_t root_rank_ = 0;
   int32_t device_ = 0;
+  bool global_ = false;
   std::string tensor_name_;
   std::vector<int64_t> tensor_shape_;
 };
@@ -134,6 +138,9 @@ public:
   void set_devices(const std::vector<int32_t>& value);
   void add_devices(int32_t value);
 
+  const bool& global() const;
+  void set_global(const bool& value);
+
   // Empty unless response_type is ALLGATHER.
   // These tensor sizes are the dimension zero sizes of all the input matrices,
   // indexed by the rank.
@@ -150,6 +157,7 @@ private:
   std::string error_message_;
   std::vector<int32_t> devices_;
   std::vector<int64_t> tensor_sizes_;
+  bool global_;
 };
 
 class MPIResponseList {

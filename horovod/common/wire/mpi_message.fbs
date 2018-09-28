@@ -52,6 +52,9 @@ table MPIRequest {
     // Device this request is made on.
     device:int;
 
+    // Flag to perform operation globally
+    global:bool;
+
     // We use a repeated integer instead of a TensorShapeProto because linking directly
     // to TensorFlow protos causes issues. See the comment for MPIDataType.
     tensor_shape:[long];
@@ -86,6 +89,9 @@ table MPIResponse {
 
     // List of devices participating in this operation.
     devices:[int];
+
+    // Flag to perform operation globally
+    global:bool;
 
     // Empty unless response_type is ALLGATHER.
     // These tensor sizes are the dimension zero sizes of all the input matrices,

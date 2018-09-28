@@ -267,15 +267,16 @@ common::ReadyEvent* RecordReadyEvent(OpKernelContext* context) {
 
 } // namespace
 
-class HorovodAllreduceOp : public AsyncOpKernel {
+class HorovodGlobalAllreduceOp : public AsyncOpKernel {
 public:
-  explicit HorovodAllreduceOp(OpKernelConstruction* context)
+  explicit HorovodGlobalAllreduceOp(OpKernelConstruction* context)
       : AsyncOpKernel(context) {}
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
                          done);
 
+    auto global_op = true;
     auto node_name = name();
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
@@ -288,7 +289,69 @@ public:
     auto hvd_tensor = std::make_shared<TFTensor>(tensor);
     auto hvd_output = std::make_shared<TFTensor>(*output);
     auto enqueue_result = EnqueueTensorAllreduce(
-        hvd_context, hvd_tensor, hvd_output, ready_event, node_name, device,
+        hvd_context, hvd_tensor, hvd_output, ready_event, node_name, device, global_op,
+        [context, done](const common::Status& status) {
+          context->SetStatus(ConvertStatus(status));
+          done();
+        });
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
+  }
+};
+
+REGISTER_KERNEL_BUILDER(Name("HorovodGlobalAllreduce").Device(DEVICE_CPU),
+                        HorovodGlobalAllreduceOp);
+#if HOROVOD_GPU_ALLREDUCE
+REGISTER_KERNEL_BUILDER(Name("HorovodGlobalAllreduce").Device(DEVICE_GPU),
+                        HorovodGlobalAllreduceOp);
+#endif
+
+REGISTER_OP("HorovodGlobalAllreduce")
+    .Attr("T: {int32, int64, float32, float64}")
+    .Input("tensor: T")
+    .Output("sum: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Perform an MPI Allreduce on a tensor. All other processes that do a reduction
+on a tensor with the same name must have the same dimension for that tensor.
+Tensors are reduced with other tensors that have the same node name for the
+allreduce.
+
+Arguments
+    tensor:     A tensor to reduce.
+
+Output
+    sum:    A tensor with the same shape as `tensor`, summed across all MPI processes.
+)doc");
+
+
+
+class HorovodAllreduceOp : public AsyncOpKernel {
+public:
+  explicit HorovodAllreduceOp(OpKernelConstruction* context)
+      : AsyncOpKernel(context) {}
+
+  void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
+                         done);
+
+    auto global_op = false;
+    auto node_name = name();
+    auto device = GetDeviceID(context);
+    auto tensor = context->input(0);
+    Tensor* output;
+    OP_REQUIRES_OK_ASYNC(
+        context, context->allocate_output(0, tensor.shape(), &output), done);
+
+    // ReadyEvent makes sure input tensor is ready, and output is allocated.
+    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    auto hvd_context = std::make_shared<TFOpContext>(context);
+    auto hvd_tensor = std::make_shared<TFTensor>(tensor);
+    auto hvd_output = std::make_shared<TFTensor>(*output);
+    auto enqueue_result = EnqueueTensorAllreduce(
+        hvd_context, hvd_tensor, hvd_output, ready_event, node_name, device, global_op,
         [context, done](const common::Status& status) {
           context->SetStatus(ConvertStatus(status));
           done();
@@ -325,15 +388,17 @@ Output
     sum:    A tensor with the same shape as `tensor`, summed across all MPI processes.
 )doc");
 
-class HorovodAllgatherOp : public AsyncOpKernel {
+
+class HorovodGlobalAllgatherOp : public AsyncOpKernel {
 public:
-  explicit HorovodAllgatherOp(OpKernelConstruction* context)
+  explicit HorovodGlobalAllgatherOp(OpKernelConstruction* context)
       : AsyncOpKernel(context) {}
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
                          done);
 
+    auto global_op = true;
     auto node_name = name();
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
@@ -344,7 +409,69 @@ public:
     auto hvd_context = std::make_shared<TFOpContext>(context);
     auto hvd_tensor = std::make_shared<TFTensor>(tensor);
     auto enqueue_result = EnqueueTensorAllgather(
-        hvd_context, hvd_tensor, ready_event, node_name, device,
+        hvd_context, hvd_tensor, ready_event, node_name, device, global_op,
+        [context, done](const common::Status& status) {
+          context->SetStatus(ConvertStatus(status));
+          done();
+        });
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
+  }
+}; // namespace tensorflow
+
+REGISTER_KERNEL_BUILDER(Name("HorovodGlobalAllgather").Device(DEVICE_CPU),
+                        HorovodGlobalAllgatherOp);
+#if HOROVOD_GPU_ALLGATHER
+REGISTER_KERNEL_BUILDER(Name("HorovodGlobalAllgather").Device(DEVICE_GPU),
+                        HorovodGlobalAllgatherOp);
+#endif
+
+REGISTER_OP("HorovodGlobalAllgather")
+    .Attr(
+        "T: {uint8, int8, uint16, int16, int32, int64, float32, float64, bool}")
+    .Input("tensor: T")
+    .Output("output: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle output;
+      TF_RETURN_IF_ERROR(
+          c->ReplaceDim(c->input(0), 0, c->UnknownDim(), &output));
+      c->set_output(0, output);
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Perform an MPI Allgather on a tensor. All other processes that do a gather on a
+tensor with the same name must have the same rank for that tensor, and have the
+same dimension on all but the first dimension.
+
+Arguments
+    tensor:     A tensor to gather.
+
+Output
+    gathered:    A tensor with the same shape as `tensor` except for the first dimension.
+)doc");
+
+
+
+class HorovodAllgatherOp : public AsyncOpKernel {
+public:
+  explicit HorovodAllgatherOp(OpKernelConstruction* context)
+      : AsyncOpKernel(context) {}
+
+  void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
+                         done);
+
+    auto global_op = false;
+    auto node_name = name();
+    auto device = GetDeviceID(context);
+    auto tensor = context->input(0);
+    // ReadyEvent makes sure input tensor is ready.  We cannot pre-allocate
+    // output for allgather, since shape of result is only known after all
+    // ranks make a request.
+    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    auto hvd_context = std::make_shared<TFOpContext>(context);
+    auto hvd_tensor = std::make_shared<TFTensor>(tensor);
+    auto enqueue_result = EnqueueTensorAllgather(
+        hvd_context, hvd_tensor, ready_event, node_name, device, global_op,
         [context, done](const common::Status& status) {
           context->SetStatus(ConvertStatus(status));
           done();
@@ -384,9 +511,9 @@ Output
     gathered:    A tensor with the same shape as `tensor` except for the first dimension.
 )doc");
 
-class HorovodBroadcastOp : public AsyncOpKernel {
+class HorovodGlobalBroadcastOp : public AsyncOpKernel {
 public:
-  explicit HorovodBroadcastOp(OpKernelConstruction* context)
+  explicit HorovodGlobalBroadcastOp(OpKernelConstruction* context)
       : AsyncOpKernel(context) {
     OP_REQUIRES_OK(context, context->GetAttr("root_rank", &root_rank_));
   }
@@ -395,6 +522,7 @@ public:
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
                          done);
 
+    auto global_op = true;
     auto node_name = name();
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
@@ -414,7 +542,81 @@ public:
       hvd_output = std::make_shared<TFTensor>(*output);
     }
     auto enqueue_result = EnqueueTensorBroadcast(
-        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name,
+        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name, global_op,
+        device, [context, done](const common::Status& status) {
+          context->SetStatus(ConvertStatus(status));
+          done();
+        });
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
+  }
+
+private:
+  int root_rank_;
+};
+
+REGISTER_KERNEL_BUILDER(Name("HorovodGlobalBroadcast").Device(DEVICE_CPU),
+                        HorovodGlobalBroadcastOp);
+#if HOROVOD_GPU_BROADCAST
+REGISTER_KERNEL_BUILDER(Name("HorovodGlobalBroadcast").Device(DEVICE_GPU),
+                        HorovodGlobalBroadcastOp);
+#endif
+
+REGISTER_OP("HorovodGlobalBroadcast")
+    .Attr(
+        "T: {uint8, int8, uint16, int16, int32, int64, float32, float64, bool}")
+    .Attr("root_rank: int")
+    .Input("tensor: T")
+    .Output("output: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Perform an MPI Broadcast on a tensor. All other processes that do a broadcast
+on a tensor with the same name must have the same dimension for that tensor.
+
+Arguments
+    tensor:     A tensor to broadcast.
+    root_rank:  Rank that will send data, other ranks will receive data.
+
+Output
+    output:    A tensor with the same shape as `tensor` and same value as
+               `tensor` on root rank.
+)doc");
+
+
+class HorovodBroadcastOp : public AsyncOpKernel {
+public:
+  explicit HorovodBroadcastOp(OpKernelConstruction* context)
+      : AsyncOpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("root_rank", &root_rank_));
+  }
+
+  void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
+                         done);
+
+    auto global_op = false;
+    auto node_name = name();
+    auto device = GetDeviceID(context);
+    auto tensor = context->input(0);
+    Tensor* output = nullptr;
+    if (common::horovod_rank() == root_rank_) {
+      context->set_output(0, tensor);
+    } else {
+      OP_REQUIRES_OK_ASYNC(
+          context, context->allocate_output(0, tensor.shape(), &output), done);
+    }
+    // ReadyEvent makes sure input tensor is ready, and output is allocated.
+    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    auto hvd_context = std::make_shared<TFOpContext>(context);
+    auto hvd_tensor = std::make_shared<TFTensor>(tensor);
+    std::shared_ptr<TFTensor> hvd_output = nullptr;
+    if (output != nullptr) {
+      hvd_output = std::make_shared<TFTensor>(*output);
+    }
+    auto enqueue_result = EnqueueTensorBroadcast(
+        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name, global_op,
         device, [context, done](const common::Status& status) {
           context->SetStatus(ConvertStatus(status));
           done();

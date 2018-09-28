@@ -98,8 +98,10 @@ int32_t MPIRequest::root_rank() const { return root_rank_; }
 void MPIRequest::set_root_rank(int32_t value) { root_rank_ = value; }
 
 int32_t MPIRequest::device() const { return device_; }
+bool MPIRequest::global() const { return global_; }
 
 void MPIRequest::set_device(int32_t value) { device_ = value; }
+void MPIRequest::set_global(bool value) { global_ = value; }
 
 const std::vector<int64_t>& MPIRequest::tensor_shape() const {
   return tensor_shape_;
@@ -123,6 +125,7 @@ void MPIRequest_ParseFromWire(MPIRequest& request,
   request.set_tensor_name(obj->tensor_name()->str());
   request.set_root_rank(obj->root_rank());
   request.set_device(obj->device());
+  request.set_global(obj->global());
   request.set_tensor_shape(std::vector<int64_t>(obj->tensor_shape()->begin(),
                                                 obj->tensor_shape()->end()));
 }
@@ -142,6 +145,7 @@ void MPIRequest_SerializeToWire(const MPIRequest& request,
   request_builder.add_tensor_name(tensor_name_wire);
   request_builder.add_root_rank(request.root_rank());
   request_builder.add_device(request.device());
+  request_builder.add_global(request.global());
   request_builder.add_tensor_shape(tensor_shape_wire);
   obj = request_builder.Finish();
 }
@@ -263,10 +267,16 @@ void MPIResponse::set_error_message(const std::string& value) {
 }
 
 const std::vector<int32_t>& MPIResponse::devices() const { return devices_; }
+const bool& MPIResponse::global() const { return global_; }
 
 void MPIResponse::set_devices(const std::vector<int32_t>& value) {
   devices_ = value;
 }
+
+void MPIResponse::set_global(const bool& value) {
+  global_ = value;
+}
+
 
 void MPIResponse::add_devices(int32_t value) { devices_.push_back(value); }
 
@@ -289,6 +299,7 @@ void MPIResponse_ParseFromWire(MPIResponse& response,
     response.add_tensor_names(tensor_name_obj->str());
   }
   response.set_error_message(obj->error_message()->str());
+  response.set_global(obj->global());
   response.set_devices(
       std::vector<int32_t>(obj->devices()->begin(), obj->devices()->end()));
   response.set_tensor_sizes(std::vector<int64_t>(obj->tensor_sizes()->begin(),
@@ -317,6 +328,7 @@ void MPIResponse_SerializeToWire(const MPIResponse& response,
   response_builder.add_tensor_names(tensor_names_wire);
   response_builder.add_error_message(error_message_wire);
   response_builder.add_devices(devices_wire);
+  response_builder.add_global(response.global());
   response_builder.add_tensor_sizes(tensor_sizes_wire);
   obj = response_builder.Finish();
 }

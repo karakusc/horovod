@@ -55,7 +55,8 @@ def _load_library(name, op_list=None):
 
 
 MPI_LIB = _load_library('mpi_lib' + get_ext_suffix(),
-                        ['HorovodAllgather', 'HorovodAllreduce'])
+                        ['HorovodGlobalAllgather', 'HorovodGlobalAllreduce',
+                        'HorovodAllgather', 'HorovodAllreduce'])
 
 _basics = _HorovodBasics(__file__, 'mpi_lib')
 
@@ -74,7 +75,7 @@ def _normalize_name(name):
     return re.sub('[^a-zA-Z0-9_]', '_', name)
 
 
-def _allreduce(tensor, name=None):
+def _allreduce(tensor, name=None, global_op=False):
     """An op which sums an input tensor over all the Horovod processes.
 
     The reduction operation is keyed by the name of the op. The tensor type and
@@ -85,9 +86,28 @@ def _allreduce(tensor, name=None):
       A tensor of the same shape and type as `tensor`, summed across all
       processes.
     """
-    if name is None:
-        name = 'HorovodAllreduce_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_allreduce(tensor, name=name)
+    if global_op:
+      if name is None:
+          name = 'HorovodGlobalAllreduce_%s' % _normalize_name(tensor.name)
+      return MPI_LIB.horovod_global_allreduce(tensor, name=name)
+    else:
+      if name is None:
+          name = 'HorovodAllreduce_%s' % _normalize_name(tensor.name)
+      return MPI_LIB.horovod_allreduce(tensor, name=name)
+
+
+@ops.RegisterGradient('HorovodGlobalAllreduce')
+def _global_allreduce_grad(op, grad):
+    """Gradient for global allreduce op.
+
+    Args:
+      op: An operation.
+      grad: `Tensor` gradient with respect to the output of the op.
+
+    Returns:
+      The gradient with respect to the input of the op.
+    """
+    return _allreduce(grad, global_op=True)
 
 
 @ops.RegisterGradient('HorovodAllreduce')
@@ -101,10 +121,10 @@ def _allreduce_grad(op, grad):
     Returns:
       The gradient with respect to the input of the op.
     """
-    return _allreduce(grad)
+    return _allreduce(grad, global_op=False)
 
 
-def allgather(tensor, name=None):
+def allgather(tensor, name=None, global_op=False):
     """An op which concatenates the input tensor with the same input tensor on
     all other Horovod processes.
 
@@ -118,9 +138,38 @@ def allgather(tensor, name=None):
       the first dimension, which may be greater and is the sum of all first
       dimensions of the tensors in different Horovod processes.
     """
-    if name is None:
-        name = 'HorovodAllgather_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_allgather(tensor, name=name)
+    if global_op:
+      if name is None:
+          name = 'HorovodGlobalAllgather_%s' % _normalize_name(tensor.name)
+      return MPI_LIB.horovod_global_allgather(tensor, name=name)
+    else:
+      if name is None:
+          name = 'HorovodAllgather_%s' % _normalize_name(tensor.name)
+      return MPI_LIB.horovod_allgather(tensor, name=name)
+
+
+@ops.RegisterGradient('HorovodGlobalAllgather')
+def _global_allgather_grad(op, grad):
+    """Gradient for global allgather op.
+
+    Args:
+      op: An operation.
+      grad: `Tensor` gradient with respect to the output of the op.
+
+    Returns:
+      The gradient with respect to the input of the op.
+    """
+    grad = _allreduce(grad, global_op=True)
+
+    x = op.inputs[0]
+    d0 = x.get_shape().as_list()[0]
+    d = tf.convert_to_tensor([d0], dtype=tf.int32)
+
+    s = size()
+    d = tf.reshape(allgather(d), [s])
+
+    splits = tf.split(grad, num_or_size_splits=d, axis=0)
+    return splits[rank()]
 
 
 @ops.RegisterGradient('HorovodAllgather')
@@ -134,7 +183,7 @@ def _allgather_grad(op, grad):
     Returns:
       The gradient with respect to the input of the op.
     """
-    grad = _allreduce(grad)
+    grad = _allreduce(grad, global_op=False)
 
     x = op.inputs[0]
     d0 = x.get_shape().as_list()[0]
@@ -147,7 +196,7 @@ def _allgather_grad(op, grad):
     return splits[rank()]
 
 
-def broadcast(tensor, root_rank, name=None):
+def broadcast(tensor, root_rank, name=None, global_op=False):
     """An op which broadcasts the input tensor on root rank to the same input tensor
     on all other Horovod processes.
 
@@ -159,9 +208,32 @@ def broadcast(tensor, root_rank, name=None):
       A tensor of the same shape and type as `tensor`, with the value broadcasted
       from root rank.
     """
-    if name is None:
-        name = 'HorovodBroadcast_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_broadcast(tensor, name=name, root_rank=root_rank)
+    if global_op:
+      if name is None:
+          name = 'HorovodGlobalBroadcast_%s' % _normalize_name(tensor.name)
+      return MPI_LIB.horovod_global_broadcast(tensor, name=name, root_rank=root_rank)
+    else:
+      if name is None:
+          name = 'HorovodBroadcast_%s' % _normalize_name(tensor.name)
+      return MPI_LIB.horovod_broadcast(tensor, name=name, root_rank=root_rank)
+
+
+@ops.RegisterGradient('HorovodGlobalBroadcast')
+def _global_broadcast_grad(op, grad):
+    """Gradient for global broadcast op.
+
+    Args:
+      op: An operation.
+      grad: `Tensor` gradient with respect to the output of the op.
+
+    Returns:
+      The gradient with respect to the input of the op.
+    """
+    root_rank = op.get_attr('root_rank')
+    grad_reduced = _allreduce(grad, global_op=True)
+    if rank() != root_rank:
+        return grad_reduced * 0
+    return grad_reduced
 
 
 @ops.RegisterGradient('HorovodBroadcast')
@@ -176,7 +248,7 @@ def _broadcast_grad(op, grad):
       The gradient with respect to the input of the op.
     """
     root_rank = op.get_attr('root_rank')
-    grad_reduced = _allreduce(grad)
+    grad_reduced = _allreduce(grad, global_op=False)
     if rank() != root_rank:
         return grad_reduced * 0
     return grad_reduced

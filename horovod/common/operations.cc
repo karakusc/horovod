@@ -952,7 +952,6 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
         std::cout << "nccl rank " << nccl_rank <<" -- " <<horovod_global.rank << std::endl;
         std::cout << "nccl size " << nccl_size  <<" -- " <<horovod_global.rank << std::endl;
         std::cout << "using_group_comm " << (nccl_id_bcast_comm==horovod_global.group_comm)  <<" -- " <<horovod_global.rank << std::endl;
-        std::cout << "nccl ID " << nccl_id  <<" -- " <<horovod_global.rank << std::endl;
 
         ncclComm_t new_nccl_comm;
         NCCL_CHECK(

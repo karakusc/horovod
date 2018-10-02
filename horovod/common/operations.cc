@@ -812,10 +812,6 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                  horovod_global.mpi_comm :
                  horovod_global.group_comm;
 
-  std::cout << "global_allreduce is " << global_allreduce << " == " << horovod_global.rank << std::endl;
-  std::cout << "hierarchical is " << do_hierarchical << " == " << horovod_global.rank << std::endl;
-  std::cout << "keep_global is " << horovod_global.keep_global << " == " << horovod_global.rank << std::endl;
-
   Status status;
   if (response.response_type() == MPIResponse::ALLGATHER) {
     assert(entries.size() == 1);
@@ -934,7 +930,6 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
           nccl_size = horovod_global.local_size;
           nccl_id_bcast_comm = horovod_global.local_comm;
         } else {
-          int nccl_rank, nccl_size;
           MPI_Comm_rank(mpi_comm, &nccl_rank);
           MPI_Comm_size(mpi_comm, &nccl_size);
           nccl_id_bcast_comm = mpi_comm;
@@ -948,10 +943,6 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
         MPI_CHECK(entries, "MPI_Bcast",
                   MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0,
                             nccl_id_bcast_comm));
-
-        std::cout << "nccl rank " << nccl_rank <<" -- " <<horovod_global.rank << std::endl;
-        std::cout << "nccl size " << nccl_size  <<" -- " <<horovod_global.rank << std::endl;
-        std::cout << "using_group_comm " << (nccl_id_bcast_comm==horovod_global.group_comm)  <<" -- " <<horovod_global.rank << std::endl;
 
         ncclComm_t new_nccl_comm;
         NCCL_CHECK(
@@ -1503,12 +1494,9 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     if (state.keep_global) {
       MPI_Comm_dup(MPI_COMM_WORLD, &(horovod_global.mpi_comm));
       MPI_Comm_create_group(MPI_COMM_WORLD, work_group, 0, &(state.group_comm));
-      std::cout << "Created work group..." <<std::endl;
     } else {
       MPI_Comm_create_group(MPI_COMM_WORLD, work_group, 0, &(state.mpi_comm));
       horovod_global.group_comm = nullptr;
-
-      std::cout << "DID NOT CREATE work group..." <<std::endl;
     }
     if (state.mpi_comm == MPI_COMM_NULL) {
       std::cerr << "WARNING: Unable to create Horovod communicator, using "

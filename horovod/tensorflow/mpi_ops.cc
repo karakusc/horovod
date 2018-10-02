@@ -542,8 +542,8 @@ public:
       hvd_output = std::make_shared<TFTensor>(*output);
     }
     auto enqueue_result = EnqueueTensorBroadcast(
-        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name, global_op,
-        device, [context, done](const common::Status& status) {
+        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name,
+        device, global_op, [context, done](const common::Status& status) {
           context->SetStatus(ConvertStatus(status));
           done();
         });
@@ -616,8 +616,8 @@ public:
       hvd_output = std::make_shared<TFTensor>(*output);
     }
     auto enqueue_result = EnqueueTensorBroadcast(
-        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name, global_op,
-        device, [context, done](const common::Status& status) {
+        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name,
+        device, global_op, [context, done](const common::Status& status) {
           context->SetStatus(ConvertStatus(status));
           done();
         });

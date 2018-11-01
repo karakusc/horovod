@@ -811,7 +811,6 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
   MPI_Comm mpi_comm = (!horovod_global.keep_global || global_allreduce) ?
                  horovod_global.mpi_comm :
                  horovod_global.group_comm;
-
   Status status;
   if (response.response_type() == MPIResponse::ALLGATHER) {
     assert(entries.size() == 1);
@@ -904,15 +903,19 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       // Determine GPU IDs of the devices participating in this communicator.
       std::vector<int32_t> nccl_device_map;
       if (do_hierarchical) {
+
       //if (horovod_global.hierarchical_allreduce) {
         for (int rank : horovod_global.local_comm_ranks) {
           nccl_device_map.push_back(response.devices()[rank]);
+
         }
       } else {    // consider all possibilities here. keep_global = true/false, ranks.size() /= 0, reponse.global() = t/f
         if(global_allreduce) { 
           nccl_device_map = response.devices();
+
         } else {
           nccl_device_map = horovod_global.ranks;
+
         }
       }
 
@@ -952,7 +955,8 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
         // Barrier helps NCCL to synchronize after initialization and avoid
         // deadlock that we've been seeing without it.
-        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(mpi_comm));
+//        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(mpi_comm));
+        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(nccl_id_bcast_comm));
 
         ACTIVITY_END_ALL(entries, timeline)
       }
@@ -1050,6 +1054,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                               DDL_OP_SUM))
 #else
       if (do_hierarchical) {
+
       //if (horovod_global.hierarchical_allreduce) {
         int element_size;
         MPI_Type_size(GetMPIDataType(first_entry.tensor), &element_size); 

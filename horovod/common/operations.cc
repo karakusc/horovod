@@ -170,6 +170,7 @@ struct HorovodGlobalState {
   int cross_size = 1;
   bool mpi_threads_supported = false;
   bool is_homogeneous = false;
+  int torus_allreduce = 0;
   std::vector<int> ranks;
 
   // COMM_WORLD ranks of processes running on this node.
@@ -191,6 +192,12 @@ struct HorovodGlobalState {
 
   // Cross-node communicator for hierarchical allreduce.
   MPI_Comm cross_comm;
+
+  // Torus allreduce
+  MPI_Comm mpi_comm_hor;
+  MPI_Comm mpi_comm_ver;
+  MPI_Comm cross_comm_hor;
+  MPI_Comm cross_comm_ver;
 
   // MPI Window used for shared memory allgather
   MPI_Win window;
@@ -1304,7 +1311,26 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
           ACTIVITY_END_ALL(entries, timeline)
 
           ACTIVITY_START_ALL(entries, timeline, MPI_ALLREDUCE)
-          MPI_CHECK(entries, "MPI_Allreduce",
+          if (horovod_global.torus_allreduce > 0) {
+            MPI_CHECK(entries, "MPI_Allreduce",
+                    MPI_Allreduce(MPI_IN_PLACE, host_buffer,
+                                  (int)total_num_elements,
+                                  GetMPIDataType(first_entry.tensor),
+                                  first_entry.tensor->dtype() == HOROVOD_FLOAT16
+                                      ? horovod_global.mpi_float16_sum
+                                      : MPI_SUM,
+                                  horovod_global.cross_comm_ver))
+            MPI_CHECK(entries, "MPI_Allreduce",
+                    MPI_Allreduce(MPI_IN_PLACE, host_buffer,
+                                  (int)total_num_elements,
+                                  GetMPIDataType(first_entry.tensor),
+                                  first_entry.tensor->dtype() == HOROVOD_FLOAT16
+                                      ? horovod_global.mpi_float16_sum
+                                      : MPI_SUM,
+                                  horovod_global.cross_comm_hor))
+
+          } else {
+            MPI_CHECK(entries, "MPI_Allreduce",
                     MPI_Allreduce(MPI_IN_PLACE, host_buffer,
                                   (int)total_num_elements,
                                   GetMPIDataType(first_entry.tensor),
@@ -1312,6 +1338,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                                       ? horovod_global.mpi_float16_sum
                                       : MPI_SUM,
                                   horovod_global.cross_comm))
+          }
           ACTIVITY_END_ALL(entries, timeline)
 
           ACTIVITY_START_ALL(entries, timeline, MEMCPY_OUT_HOST_BUFFER)
@@ -1484,7 +1511,28 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       const void* sendbuf = e.tensor->data() == e.output->data()
                                 ? MPI_IN_PLACE
                                 : e.tensor->data();
-      MPI_CHECK(entries, "MPI_Allreduce",
+
+      if (horovod_global.torus_allreduce > 0) {
+        MPI_CHECK(entries, "MPI_Allreduce",
+                MPI_Allreduce(sendbuf, (void*)e.output->data(),
+                              (int)e.tensor->shape().num_elements(),
+                              GetMPIDataType(e.tensor),
+                              first_entry.tensor->dtype() == HOROVOD_FLOAT16
+                                  ? horovod_global.mpi_float16_sum
+                                  : MPI_SUM,
+                              horovod_global.mpi_comm_hor))
+
+        MPI_CHECK(entries, "MPI_Allreduce",
+                MPI_Allreduce(MPI_IN_PLACE, (void*)e.output->data(),
+                              (int)e.tensor->shape().num_elements(),
+                              GetMPIDataType(e.tensor),
+                              first_entry.tensor->dtype() == HOROVOD_FLOAT16
+                                  ? horovod_global.mpi_float16_sum
+                                  : MPI_SUM,
+                              horovod_global.mpi_comm_ver))
+        ACTIVITY_END_ALL(entries, timeline)
+      } else {
+        MPI_CHECK(entries, "MPI_Allreduce",
                 MPI_Allreduce(sendbuf, (void*)e.output->data(),
                               (int)e.tensor->shape().num_elements(),
                               GetMPIDataType(e.tensor),
@@ -1492,7 +1540,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                                   ? horovod_global.mpi_float16_sum
                                   : MPI_SUM,
                               horovod_global.mpi_comm))
-      ACTIVITY_END_ALL(entries, timeline)
+      }
     }
 
     for (auto& e : entries) {
@@ -1729,6 +1777,29 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   state.mpi_threads_supported = (provided == MPI_THREAD_MULTIPLE);
   state.local_comm_ranks = local_comm_ranks;
 
+  // 3D-torus allreduce
+  auto horovod_torus_allreduce = std::getenv(HOROVOD_TORUS_ALLREDUCE);
+  if (horovod_torus_allreduce != nullptr) {
+    int value = std::strtol(horovod_torus_allreduce , nullptr, 10); 
+    state.torus_allreduce = value;
+  }
+
+  MPI_Comm mpi_comm_hor;
+  MPI_Comm mpi_comm_ver;
+  MPI_Comm cross_comm_hor;
+  MPI_Comm cross_comm_ver;
+
+  if (state.torus_allreduce > 0) {
+    MPI_Comm_split(state.mpi_comm, rank%state.torus_allreduce, rank, &mpi_comm_hor);
+    MPI_Comm_split(state.mpi_comm, rank/state.torus_allreduce, rank, &mpi_comm_ver);
+    MPI_Comm_split(cross_comm, cross_rank%state.torus_allreduce, rank, &cross_comm_hor);
+    MPI_Comm_split(cross_comm, cross_rank/state.torus_allreduce, rank, &cross_comm_ver);
+    state.mpi_comm_hor = mpi_comm_hor;
+    state.mpi_comm_ver = mpi_comm_ver;
+    state.cross_comm_hor = cross_comm_hor;
+    state.cross_comm_ver = cross_comm_ver;
+  }
+
   // Open the timeline file on coordinator.
   auto horovod_timeline = std::getenv(HOROVOD_TIMELINE);
   if (is_coordinator && horovod_timeline != nullptr) {
@@ -1863,6 +1934,22 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 
   if (horovod_global.cross_comm != MPI_COMM_NULL) {
     MPI_Comm_free(&horovod_global.cross_comm);
+  }
+
+  if (horovod_global.cross_comm_ver != nullptr && horovod_global.cross_comm_ver != MPI_COMM_NULL ) {
+    MPI_Comm_free(&horovod_global.cross_comm_ver);
+  }
+
+  if (horovod_global.cross_comm_hor != nullptr && horovod_global.cross_comm_hor != MPI_COMM_NULL) {
+    MPI_Comm_free(&horovod_global.cross_comm_hor);
+  }
+
+  if (horovod_global.mpi_comm_ver != nullptr && horovod_global.mpi_comm_ver != MPI_COMM_NULL) {
+    MPI_Comm_free(&horovod_global.mpi_comm_ver);
+  }
+
+  if (horovod_global.mpi_comm_hor != nullptr && horovod_global.mpi_comm_hor != MPI_COMM_NULL) {
+    MPI_Comm_free(&horovod_global.mpi_comm_hor);
   }
 
   if (horovod_global.mpi_float16_t != MPI_DATATYPE_NULL) {

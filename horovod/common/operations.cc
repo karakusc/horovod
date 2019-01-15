@@ -1263,6 +1263,11 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
             is_root_rank ? buffer_len_per_rank + buffer_len_remaining
                          : buffer_len_per_rank;
 
+        int* recvcounts_ver;
+        int* displcmnts_ver;
+        int hor_size, ver_size, ver_rank;
+        void* host_buffer_at_offset;
+
         if (num_elements_per_rank > 0) {
           NCCL_CHECK(entries, "ncclReduceScatter",
                      ncclReduceScatter(fused_input_data,
@@ -1310,24 +1315,59 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                                      stream))
           ACTIVITY_END_ALL(entries, timeline)
 
-          ACTIVITY_START_ALL(entries, timeline, MPI_ALLREDUCE)
           if (horovod_global.torus_allreduce > 0) {
-            MPI_CHECK(entries, "MPI_Allreduce",
-                    MPI_Allreduce(MPI_IN_PLACE, host_buffer,
-                                  (int)total_num_elements,
+            hor_size = horovod_global.torus_allreduce;
+            ver_size = horovod_global.cross_size/horovod_global.torus_allreduce;
+            recvcounts_ver = new int[ver_size];
+            displcmnts_ver = new int[ver_size];
+
+            for (int i=0; i<ver_size; i++) {
+              recvcounts_ver[i] = i < ((int)total_num_elements)%ver_size ? 
+                                          ((int)total_num_elements)/ver_size + 1 :
+                                          ((int)total_num_elements)/ver_size;
+              if (i == 0) {
+                displcmnts_ver[i] = 0;
+              } else {
+                displcmnts_ver[i] = displcmnts_ver[i-1] + recvcounts_ver[i-1];
+              }
+            }
+
+            MPI_Comm_rank(horovod_global.cross_comm_ver, &ver_rank); 
+            host_buffer_at_offset = (uint8_t*)host_buffer + displcmnts_ver[ver_rank]*element_size; 
+
+            ACTIVITY_START_ALL(entries, timeline, MPI_REDUCESCATTER)
+            MPI_CHECK(entries, "MPI_Reduce_scatter",
+                    MPI_Reduce_scatter(host_buffer, host_buffer_at_offset,
+                                   recvcounts_ver,
                                   GetMPIDataType(first_entry.tensor),
                                   first_entry.tensor->dtype() == HOROVOD_FLOAT16
                                       ? horovod_global.mpi_float16_sum
                                       : MPI_SUM,
                                   horovod_global.cross_comm_ver))
+
+            ACTIVITY_END_ALL(entries, timeline)
+            ACTIVITY_START_ALL(entries, timeline, MPI_ALLREDUCE)
             MPI_CHECK(entries, "MPI_Allreduce",
-                    MPI_Allreduce(MPI_IN_PLACE, host_buffer,
-                                  (int)total_num_elements,
+                    MPI_Allreduce(MPI_IN_PLACE, host_buffer_at_offset,
+                                  recvcounts_ver[ver_rank],
+//                                  (int)total_num_elements,
                                   GetMPIDataType(first_entry.tensor),
                                   first_entry.tensor->dtype() == HOROVOD_FLOAT16
                                       ? horovod_global.mpi_float16_sum
                                       : MPI_SUM,
                                   horovod_global.cross_comm_hor))
+
+            ACTIVITY_END_ALL(entries, timeline)
+            ACTIVITY_START_ALL(entries, timeline, MPI_ALLGATHER)
+            MPI_CHECK(entries, "MPI_Allgather",
+                    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL,
+                                  host_buffer, recvcounts_ver, displcmnts_ver,
+                                  GetMPIDataType(first_entry.tensor),
+                                  horovod_global.cross_comm_ver))
+
+            ACTIVITY_END_ALL(entries, timeline)
+            delete[] recvcounts_ver;
+            delete[] displcmnts_ver;
 
           } else {
             MPI_CHECK(entries, "MPI_Allreduce",
@@ -1372,6 +1412,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
           }
         }
       } else {
+
         NCCL_CHECK(entries, "ncclAllReduce",
                    ncclAllReduce(fused_input_data, buffer_data,
                                  (size_t)num_elements,
@@ -1513,6 +1554,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                                 : e.tensor->data();
 
       if (horovod_global.torus_allreduce > 0) {
+
         MPI_CHECK(entries, "MPI_Allreduce",
                 MPI_Allreduce(sendbuf, (void*)e.output->data(),
                               (int)e.tensor->shape().num_elements(),
@@ -1789,11 +1831,14 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   MPI_Comm cross_comm_hor;
   MPI_Comm cross_comm_ver;
 
+  int ver_size = state.torus_allreduce > 0 ? 
+                   state.cross_size/state.torus_allreduce : 0;
+
   if (state.torus_allreduce > 0) {
     MPI_Comm_split(state.mpi_comm, rank%state.torus_allreduce, rank, &mpi_comm_hor);
     MPI_Comm_split(state.mpi_comm, rank/state.torus_allreduce, rank, &mpi_comm_ver);
-    MPI_Comm_split(cross_comm, cross_rank%state.torus_allreduce, rank, &cross_comm_hor);
-    MPI_Comm_split(cross_comm, cross_rank/state.torus_allreduce, rank, &cross_comm_ver);
+    MPI_Comm_split(cross_comm, cross_rank%ver_size, rank, &cross_comm_hor);
+    MPI_Comm_split(cross_comm, cross_rank/ver_size, rank, &cross_comm_ver);
     state.mpi_comm_hor = mpi_comm_hor;
     state.mpi_comm_ver = mpi_comm_ver;
     state.cross_comm_hor = cross_comm_hor;

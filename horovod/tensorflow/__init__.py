@@ -43,8 +43,52 @@ from horovod.tensorflow.util import _executing_eagerly
 
 import tensorflow as tf
 
+from tensorflow.python.ops import init_ops
 
-def allreduce(tensor, average=True, device_dense='', device_sparse='',
+
+def qsgd_compk(eta_grad, memory, s, K, topK_flag):
+        def for_top_k():
+            return tf.reshape(input,[-1])
+    
+        def for_random_k():
+            return tf.reshape(tf.random_uniform(shape = tf.shape(input), dtype = tf.float32),[-1])
+    
+        '''For finding qsgd of a non zero tensor'''
+        def qsgd():
+            level_float = s*tf.abs(var) / norm1
+            previous_level = tf.floor(level_float)
+            is_next_level = tf.less(tf.random_uniform(shape = tf.shape(var), dtype = tf.float32),(level_float - previous_level))
+            is_next_level = tf.cast(is_next_level,tf.float32)
+            new_level = previous_level + is_next_level
+            return tf.sign(var) * new_level * norm1 / s
+    
+        input = memory + eta_grad
+        '''Used to create a flattened tensor for topK or a random flat tensor for randomK'''
+        arr = tf.case([(tf.less(topK_flag,tf.constant(1)), for_random_k)], default=for_top_k)
+    
+        '''Used to find the topK of arr'''
+        values, indices = tf.nn.top_k(arr, k=K, sorted=False)
+        temp_indices = tf.meshgrid(*[tf.range(d) for d in (tf.unstack(
+               tf.shape(arr)[:(arr.get_shape().ndims - 1)]) + [K])], indexing='ij')
+        temp_indices = tf.stack(temp_indices[:-1] + [indices], axis=-1)
+        full_indices = tf.reshape(temp_indices, [-1, arr.get_shape().ndims])
+        values = tf.reshape(values, [-1])
+        mask_st = tf.SparseTensor(indices=tf.cast(
+              full_indices, dtype=tf.int64), values=tf.ones_like(values), dense_shape=tf.cast(tf.shape(arr),tf.int64))
+        mask = tf.sparse_tensor_to_dense(tf.sparse_reorder(mask_st))
+        var = tf.reshape(tf.reshape(input,[-1]) * mask,tf.shape(input))
+    
+        '''Followed by QSGD'''
+        zero_tensor = lambda: tf.zeros(tf.shape(input),tf.float32)
+        norm1 = tf.norm(var)
+        check_zero = tf.constant(0, dtype= tf.float32)
+        #d = tf.cast(d, tf.float32)
+        q = tf.case([(tf.less(check_zero,norm1), qsgd)], default=zero_tensor)
+        memory = input - q
+        return q, memory
+
+
+def allreduce(tensor, var, opt, average=True, device_dense='', device_sparse='',
               compression=Compression.none):
     """Perform an allreduce on a tf.Tensor or tf.IndexedSlices.
 
@@ -84,8 +128,17 @@ def allreduce(tensor, average=True, device_dense='', device_sparse='',
                                 dense_shape=tensor.dense_shape)
     else:
         with tf.device(device_dense):
+            param_count = 1
+            for dim in var.get_shape():
+                param_count *= dim.value
+
+            init = init_ops.constant_initializer(0, dtype=tensor.dtype)
+            memory = opt._get_or_make_slot_with_initializer(var, init, var.get_shape(), tensor.dtype, 'memory', 'error')
+            tensor_quantized, error = qsgd_compk(tensor, memory, s=4, K=max(10, int(0.1*param_count)), topK_flag=1)
+            memory.assign(error)
+
             horovod_size = tf.cast(size(), dtype=tensor.dtype)
-            tensor_compressed, ctx = compression.compress(tensor)
+            tensor_compressed, ctx = compression.compress(tensor_quantized)
             summed_tensor_compressed = _allreduce(tensor_compressed)
             summed_tensor = compression.decompress(summed_tensor_compressed, ctx)
             new_tensor = (tf.div(summed_tensor, horovod_size)
@@ -184,19 +237,14 @@ class DistributedOptimizer(tf.train.Optimizer):
         self._compression = compression
         self._sparse_as_dense = sparse_as_dense
 
-        def allreduce_grads(grads):
+        def allreduce_grads(grads_and_vars):
             with tf.name_scope(self._name + "_Allreduce"):
-                if self._sparse_as_dense:
-                    grads = [tf.convert_to_tensor(grad)
-                             if grad is not None and isinstance(grad, tf.IndexedSlices)
-                             else grad for grad in grads]
-
-                return [allreduce(grad,
+                return [allreduce(grad, var, self._optimizer,
                                   device_dense=self._device_dense,
                                   device_sparse=self._device_sparse,
                                   compression=self._compression)
                         if grad is not None else grad
-                        for grad in grads]
+                        for grad, var in grads_and_vars], [var for grad, var in grads_and_vars]
 
         if _executing_eagerly():
             self._allreduce_grads = tf.contrib.eager.defun(allreduce_grads)
@@ -206,6 +254,7 @@ class DistributedOptimizer(tf.train.Optimizer):
         super(DistributedOptimizer, self).__init__(
             name=name, use_locking=use_locking)
 
+
     def compute_gradients(self, *args, **kwargs):
         """Compute gradients of all trainable variables.
 
@@ -214,13 +263,13 @@ class DistributedOptimizer(tf.train.Optimizer):
         In DistributedOptimizer, compute_gradients() is overriden to also
         allreduce the gradients before returning them.
         """
-        gradients = self._optimizer.compute_gradients(*args, **kwargs)
+        grads_and_vars = self._optimizer.compute_gradients(*args, **kwargs)
         if size() > 1:
-            grads, vars = zip(*gradients)
-            avg_grads = self._allreduce_grads(grads)
+#            grads, vars = zip(*gradients)
+            avg_grads, vars = self._allreduce_grads(grads_and_vars)
             return list(zip(avg_grads, vars))
         else:
-            return gradients
+            return grads_and_vars
 
     def apply_gradients(self, *args, **kwargs):
         """Calls this same method on the underlying optimizer."""

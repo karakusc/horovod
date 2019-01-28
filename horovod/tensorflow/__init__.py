@@ -45,48 +45,45 @@ import tensorflow as tf
 
 from tensorflow.python.ops import init_ops
 
+def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
 
-def qsgd_compk(eta_grad, memory, s, K, topK_flag):
-        def for_top_k():
-            return tf.reshape(input,[-1])
-    
-        def for_random_k():
-            return tf.reshape(tf.random_uniform(shape = tf.shape(input), dtype = tf.float32),[-1])
-    
-        '''For finding qsgd of a non zero tensor'''
-        def qsgd():
-            level_float = s*tf.abs(var) / norm1
-            previous_level = tf.floor(level_float)
-            is_next_level = tf.less(tf.random_uniform(shape = tf.shape(var), dtype = tf.float32),(level_float - previous_level))
-            is_next_level = tf.cast(is_next_level,tf.float32)
-            new_level = previous_level + is_next_level
-            return tf.sign(var) * new_level * norm1 / s
-    
-        input = memory + eta_grad
-        '''Used to create a flattened tensor for topK or a random flat tensor for randomK'''
-        arr = tf.case([(tf.less(topK_flag,tf.constant(1)), for_random_k)], default=for_top_k)
-    
-        '''Used to find the topK of arr'''
-        values, indices = tf.nn.top_k(arr, k=K, sorted=False)
-        temp_indices = tf.meshgrid(*[tf.range(d) for d in (tf.unstack(
-               tf.shape(arr)[:(arr.get_shape().ndims - 1)]) + [K])], indexing='ij')
-        temp_indices = tf.stack(temp_indices[:-1] + [indices], axis=-1)
-        full_indices = tf.reshape(temp_indices, [-1, arr.get_shape().ndims])
-        values = tf.reshape(values, [-1])
-        mask_st = tf.SparseTensor(indices=tf.cast(
-              full_indices, dtype=tf.int64), values=tf.ones_like(values), dense_shape=tf.cast(tf.shape(arr),tf.int64))
-        mask = tf.sparse_tensor_to_dense(tf.sparse_reorder(mask_st))
-        var = tf.reshape(tf.reshape(input,[-1]) * mask,tf.shape(input))
-    
-        '''Followed by QSGD'''
-        zero_tensor = lambda: tf.zeros(tf.shape(input),tf.float32)
-        norm1 = tf.norm(var)
-        check_zero = tf.constant(0, dtype= tf.float32)
-        #d = tf.cast(d, tf.float32)
-        q = tf.case([(tf.less(check_zero,norm1), qsgd)], default=zero_tensor)
-        memory = input - q
-        return q, memory
+    def qsgd(var):
+        level_float = s*tf.abs(var) / norm1 
+        previous_level = tf.floor(level_float)
+        is_next_level = tf.less(tf.random_uniform(shape = tf.shape(var), dtype = tf.float32),(level_float - previous_level))
+        is_next_level = tf.cast(is_next_level,tf.float32)
+        new_level = previous_level + is_next_level
+        return tf.sign(var) * new_level * norm1 / s
 
+#    norm1 = tf.norm(eta_grad) + tf.constant(1e-5, dtype=tf.float32)
+#    q = qsgd(eta_grad)
+#    return q, eta_grad-q
+
+    input = memory + eta_grad
+    org_shape = tf.shape(input)
+    numel = tf.size(input)
+    K = tf.minimum(tf.constant(1000, dtype=tf.int32), numel)
+#    cast_K = tf.cast(frac*tf.cast(numel, dtype=tf.float32), tf.int32)
+#    K = tf.maximum(cast_K, tf.constant(1, dtype=tf.int32))
+
+    if topK_flag:
+        _, indices = tf.nn.top_k(tf.reshape(tf.abs(input),[-1]), k=K)
+    else:
+        indices = tf.py_func(np.random.choice, [tf.range(numel), K, tf.constant(False, dtype=tf.bool)], tf.int32)
+
+    flat_input = tf.reshape(input, [-1])
+    values = tf.gather(flat_input, indices) 
+    norm1 = tf.norm(values)
+    flattened_quantized = tf.convert_to_tensor(tf.IndexedSlices(qsgd(values), indices, dense_shape=tf.expand_dims(numel, [-1])))
+    quantization = tf.reshape(flattened_quantized, shape=org_shape)
+
+    q_func = lambda: quantization
+    zero_tensor = lambda: tf.zeros(tf.shape(input),tf.float32)
+
+    q = tf.cond(tf.less(tf.constant(0, dtype=tf.float32), norm1), q_func, zero_tensor)
+
+    err = input - q
+    return q, err 
 
 def allreduce(tensor, var, opt, average=True, device_dense='', device_sparse='',
               compression=Compression.none):
@@ -134,15 +131,19 @@ def allreduce(tensor, var, opt, average=True, device_dense='', device_sparse='',
 
             init = init_ops.constant_initializer(0, dtype=tensor.dtype)
             memory = opt._get_or_make_slot_with_initializer(var, init, var.get_shape(), tensor.dtype, 'memory', 'error')
-            tensor_quantized, error = qsgd_compk(tensor, memory, s=4, K=max(10, int(0.1*param_count)), topK_flag=1)
-            memory.assign(error)
 
-            horovod_size = tf.cast(size(), dtype=tensor.dtype)
-            tensor_compressed, ctx = compression.compress(tensor_quantized)
-            summed_tensor_compressed = _allreduce(tensor_compressed)
-            summed_tensor = compression.decompress(summed_tensor_compressed, ctx)
-            new_tensor = (tf.div(summed_tensor, horovod_size)
+            memory = opt.get_slot(var, "memory")
+            tensor_quantized, error = qsgd_compk(tensor, memory, topK_flag=1, frac=0.001, s=256)
+            mem_update_op = memory.assign(error)
+
+            with tf.control_dependencies([mem_update_op]):
+              horovod_size = tf.cast(size(), dtype=tensor.dtype)
+              tensor_compressed, ctx = compression.compress(tensor_quantized)
+              summed_tensor_compressed = _allreduce(tensor_compressed)
+              summed_tensor = compression.decompress(summed_tensor_compressed, ctx)
+              new_tensor = (tf.div(summed_tensor, horovod_size)
                           if average else summed_tensor)
+
         return new_tensor
 
 
@@ -239,10 +240,10 @@ class DistributedOptimizer(tf.train.Optimizer):
 
         def allreduce_grads(grads_and_vars):
             with tf.name_scope(self._name + "_Allreduce"):
-                return [allreduce(grad, var, self._optimizer,
+                return [allreduce(grad*self._optimizer._learning_rate, var, self._optimizer,
                                   device_dense=self._device_dense,
                                   device_sparse=self._device_sparse,
-                                  compression=self._compression)
+                                  compression=self._compression)/(self._optimizer._learning_rate + tf.constant(1e-5, dtype=tf.float32))
                         if grad is not None else grad
                         for grad, var in grads_and_vars], [var for grad, var in grads_and_vars]
 
@@ -254,6 +255,9 @@ class DistributedOptimizer(tf.train.Optimizer):
         super(DistributedOptimizer, self).__init__(
             name=name, use_locking=use_locking)
 
+#    def _create_slots(self, var_list):
+#      for v in var_list:
+#        self._zeros_slot(v, "memory", "error")
 
     def compute_gradients(self, *args, **kwargs):
         """Compute gradients of all trainable variables.

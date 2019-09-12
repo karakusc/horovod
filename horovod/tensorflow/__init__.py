@@ -45,6 +45,10 @@ import tensorflow as tf
 
 from tensorflow.python.ops import init_ops
 
+sparsify = False 
+use_memory = True
+
+
 def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
 
     def qsgd(var):
@@ -55,9 +59,21 @@ def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
         new_level = previous_level + is_next_level
         return tf.sign(var) * new_level * norm1 / s
 
-#    norm1 = tf.norm(eta_grad) + tf.constant(1e-5, dtype=tf.float32)
-#    q = qsgd(eta_grad)
-#    return q, eta_grad-q
+    def signq(var):
+        one_norm = tf.norm(var, ord=1)
+        return one_norm*tf.sign(var+1e-13)/tf.cast(tf.size(var), dtype=tf.float32)
+
+
+    if not sparsify:
+        norm1 = tf.norm(eta_grad) + tf.constant(1e-5, dtype=tf.float32)
+        if use_memory:
+            input = memory+eta_grad
+        else:
+            input = eta_grad
+
+        q = signq(input)
+
+        return q, input-q
 
     input = memory + eta_grad
     org_shape = tf.shape(input)
@@ -74,7 +90,7 @@ def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
     flat_input = tf.reshape(input, [-1])
     values = tf.gather(flat_input, indices) 
     norm1 = tf.norm(values)
-    flattened_quantized = tf.convert_to_tensor(tf.IndexedSlices(qsgd(values), indices, dense_shape=tf.expand_dims(numel, [-1])))
+    flattened_quantized = tf.convert_to_tensor(tf.IndexedSlices(signq(values), indices, dense_shape=tf.expand_dims(numel, [-1])))
     quantization = tf.reshape(flattened_quantized, shape=org_shape)
 
     q_func = lambda: quantization
@@ -132,7 +148,7 @@ def allreduce(tensor, var, opt, average=True, device_dense='', device_sparse='',
             init = init_ops.constant_initializer(0, dtype=tensor.dtype)
             memory = opt._get_or_make_slot_with_initializer(var, init, var.get_shape(), tensor.dtype, 'memory', 'error')
 
-            memory = opt.get_slot(var, "memory")
+#            memory = opt.get_slot(var, "memory")
             tensor_quantized, error = qsgd_compk(tensor, memory, topK_flag=1, frac=0.001, s=256)
             mem_update_op = memory.assign(error)
 

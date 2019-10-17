@@ -45,11 +45,9 @@ import tensorflow as tf
 
 from tensorflow.python.ops import init_ops
 
-sparsify = False 
-use_memory = True
+from horovod.tensorflow.config import *
 
-
-def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
+def qsgd_compk(eta_grad, memory, topK_flag, s):
 
     def qsgd(var):
         level_float = s*tf.abs(var) / norm1 
@@ -62,7 +60,14 @@ def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
     def signq(var):
         one_norm = tf.norm(var, ord=1)
         return one_norm*tf.sign(var+1e-13)/tf.cast(tf.size(var), dtype=tf.float32)
-
+    
+    def get_quantization(q):
+        if q == 'qsgd':
+            return qsgd
+        elif q == 'sign':
+            return signq
+        else:
+            return lambda x:x
 
     if not sparsify:
         norm1 = tf.norm(eta_grad) + tf.constant(1e-5, dtype=tf.float32)
@@ -71,16 +76,15 @@ def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
         else:
             input = eta_grad
 
-        q = signq(input)
+        func = get_quantization(quantization_scheme)
+        q = func(input)
 
         return q, input-q
 
     input = memory + eta_grad
     org_shape = tf.shape(input)
     numel = tf.size(input)
-    K = tf.minimum(tf.constant(1000, dtype=tf.int32), numel)
-#    cast_K = tf.cast(frac*tf.cast(numel, dtype=tf.float32), tf.int32)
-#    K = tf.maximum(cast_K, tf.constant(1, dtype=tf.int32))
+    K = tf.minimum(tf.constant(k, dtype=tf.int32), numel)
 
     if topK_flag:
         _, indices = tf.nn.top_k(tf.reshape(tf.abs(input),[-1]), k=K)
@@ -90,7 +94,8 @@ def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
     flat_input = tf.reshape(input, [-1])
     values = tf.gather(flat_input, indices) 
     norm1 = tf.norm(values)
-    flattened_quantized = tf.convert_to_tensor(tf.IndexedSlices(signq(values), indices, dense_shape=tf.expand_dims(numel, [-1])))
+    quantization_func = get_quantization(quantization_scheme)
+    flattened_quantized = tf.convert_to_tensor(tf.IndexedSlices(quantization_func(values), indices, dense_shape=tf.expand_dims(numel, [-1])))
     quantization = tf.reshape(flattened_quantized, shape=org_shape)
 
     q_func = lambda: quantization
@@ -101,7 +106,7 @@ def qsgd_compk(eta_grad, memory, topK_flag, frac, s):
     err = input - q
     return q, err 
 
-def allreduce(tensor, var, opt, average=True, device_dense='', device_sparse='',
+def allreduce(tensor, var, opt, wipe_memory, average=True, device_dense='', device_sparse='',
               compression=Compression.none):
     """Perform an allreduce on a tf.Tensor or tf.IndexedSlices.
 
@@ -141,16 +146,13 @@ def allreduce(tensor, var, opt, average=True, device_dense='', device_sparse='',
                                 dense_shape=tensor.dense_shape)
     else:
         with tf.device(device_dense):
-            param_count = 1
-            for dim in var.get_shape():
-                param_count *= dim.value
-
             init = init_ops.constant_initializer(0, dtype=tensor.dtype)
             memory = opt._get_or_make_slot_with_initializer(var, init, var.get_shape(), tensor.dtype, 'memory', 'error')
 
-#            memory = opt.get_slot(var, "memory")
-            tensor_quantized, error = qsgd_compk(tensor, memory, topK_flag=1, frac=0.001, s=256)
-            mem_update_op = memory.assign(error)
+            tensor_quantized, error = qsgd_compk(tensor, memory, topK_flag=top_k_sparsification, s=quantization_levels)
+
+            error_or_zero = tf.cond(wipe_memory, lambda: tf.zeros_like(error), lambda: error)
+            mem_update_op = memory.assign(error_or_zero)
 
             with tf.control_dependencies([mem_update_op]):
               horovod_size = tf.cast(size(), dtype=tensor.dtype)

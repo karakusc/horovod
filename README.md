@@ -1,3 +1,8 @@
+# QSparseLocal-SGD
+
+The implementation for QSparseLocal-SGD can be found under `horovod/tensorflow/__init__.py`. The parameters of the compression scheme are provided under `horovod/tensorflow/config.py`. The example Resnet training scripts, which also contains the local iteration logic, are in `train_resnet.py` and `eval_resnet.py`. 
+
+
 # Horovod
 
 [![Build Status](https://travis-ci.org/horovod/horovod.svg?branch=master)](https://travis-ci.org/horovod/horovod) [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE) [![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2Fuber%2Fhorovod.svg?type=shield)](https://app.fossa.io/projects/git%2Bgithub.com%2Fuber%2Fhorovod?ref=badge_shield) [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/2373/badge)](https://bestpractices.coreinfrastructure.org/projects/2373) [![Downloads](https://pepy.tech/badge/horovod)](https://pepy.tech/project/horovod)

@@ -55,7 +55,9 @@ def qsgd_compk(eta_grad, memory, topK_flag, s):
         is_next_level = tf.less(tf.random_uniform(shape = tf.shape(var), dtype = tf.float32),(level_float - previous_level))
         is_next_level = tf.cast(is_next_level,tf.float32)
         new_level = previous_level + is_next_level
-        return tf.sign(var) * new_level * norm1 / s
+        unnormalized = tf.sign(var) * new_level * norm1 / s
+        beta = tf.cast(tf.size(var), dtype=tf.float32)/tf.cast(s*s, dtype=tf.float32)
+        return unnormalized/(1.0+beta) if use_normalization else unnormalized 
 
     def signq(var):
         one_norm = tf.norm(var, ord=1)
@@ -95,12 +97,7 @@ def qsgd_compk(eta_grad, memory, topK_flag, s):
     values = tf.gather(flat_input, indices) 
     norm1 = tf.norm(values)
     quantization_func = get_quantization(quantization_scheme)
-    beta = tf.cast(K, dtype=tf.float32)/tf.cast(s*s, dtype=tf.float32)
-    if quantization_scheme is not None:
-        qvalues = quantization_func(values)/(1.0+beta)
-    else:
-        qvalues = values
-    flattened_quantized = tf.convert_to_tensor(tf.IndexedSlices(qvalues, indices, dense_shape=tf.expand_dims(numel, [-1])))
+    flattened_quantized = tf.convert_to_tensor(tf.IndexedSlices(quantization_func(values), indices, dense_shape=tf.expand_dims(numel, [-1])))
     quantization = tf.reshape(flattened_quantized, shape=org_shape)
 
     q_func = lambda: quantization
